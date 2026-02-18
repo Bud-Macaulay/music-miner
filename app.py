@@ -10,51 +10,83 @@ ARCHIVE_FILE = Path("./download_archive.txt")
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-lock = threading.Lock()  # prevents concurrent archive corruption
+lock = threading.Lock()
+tasks_lock = threading.Lock()
+
+# Each task is a dict: {"url": ..., "title": ..., "state": ...}
+download_tasks = []
+
+def extract_videos(playlist_url):
+    """
+    Returns a list of dicts for each video in the playlist.
+    """
+    ydl_opts = {"quiet": True, "extract_flat": True}
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(playlist_url, download=False)
+        videos = []
+        for entry in info.get("entries", []):
+            if entry is None:
+                continue
+            videos.append({"url": entry["url"], "title": entry.get("title", "Unknown"), "state": "queued"})
+        return videos
 
 
-def download_playlist(playlist_url: str, quality: str):
+def download_video(task, quality):
     """
-    Downloads playlist as MP3 using yt-dlp.
-    Uses archive file to avoid re-downloading videos.
+    Downloads a single video as MP3 and updates state.
     """
+    with tasks_lock:
+        task["state"] = "downloading"
 
     quality_map = {"low": "128", "medium": "192", "high": "320"}
-
     bitrate = quality_map.get(quality, "192")
 
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": str(DOWNLOAD_DIR / "%(title)s.%(ext)s"),
-        # Prevent duplicate downloads
         "download_archive": str(ARCHIVE_FILE),
         "ignoreerrors": True,
-        # Extract audio
         "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": bitrate,
-            }
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": bitrate}
         ],
-        # Metadata
         "embedmetadata": False,
         "embedthumbnail": False,
         "writethumbnail": False,
     }
 
-    with lock:
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([playlist_url])
+    try:
+        with lock:
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([task["url"]])
+        with tasks_lock:
+            task["state"] = "finished"
+    except Exception:
+        with tasks_lock:
+            task["state"] = "error"
 
 
 @app.get("/add")
-async def add_playlist(
-    playlistURL: str, quality: str = "medium", background_tasks: BackgroundTasks = None
-):
+async def add_playlist(playlistURL: str, quality: str = "medium", background_tasks: BackgroundTasks = None):
     if not playlistURL:
         raise HTTPException(status_code=400, detail="playlistURL required")
 
-    background_tasks.add_task(download_playlist, playlistURL, quality)
+    # Extract all videos first
+    try:
+        videos = extract_videos(playlistURL)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to extract playlist info")
 
-    return {"status": "queued", "playlist": playlistURL, "quality": quality}
+    with tasks_lock:
+        download_tasks.extend(videos)
+
+    # Queue each video separately
+    for video in videos:
+        background_tasks.add_task(download_video, video, quality)
+
+    return {"status": "queued", "videos": [v["title"] for v in videos]}
+
+
+@app.get("/queue")
+async def list_queue():
+    with tasks_lock:
+        return {"tasks": download_tasks}
