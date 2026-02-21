@@ -1,3 +1,5 @@
 fastapi 
-uvicorn 
+uvicorn
+websockets
 yt-dlp
+asyncio

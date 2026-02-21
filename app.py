@@ -1,7 +1,9 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from yt_dlp import YoutubeDL
 from pathlib import Path
+from fastapi import WebSocket
 import threading
+import asyncio
 
 app = FastAPI()
 
@@ -16,6 +18,7 @@ tasks_lock = threading.Lock()
 # Each task is a dict: {"url": ..., "title": ..., "state": ...}
 download_tasks = []
 
+
 def extract_videos(playlist_url):
     """
     Returns a list of dicts for each video in the playlist.
@@ -27,7 +30,13 @@ def extract_videos(playlist_url):
         for entry in info.get("entries", []):
             if entry is None:
                 continue
-            videos.append({"url": entry["url"], "title": entry.get("title", "Unknown"), "state": "queued"})
+            videos.append(
+                {
+                    "url": entry["url"],
+                    "title": entry.get("title", "Unknown"),
+                    "state": "queued",
+                }
+            )
         return videos
 
 
@@ -47,7 +56,11 @@ def download_video(task, quality):
         "download_archive": str(ARCHIVE_FILE),
         "ignoreerrors": True,
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": bitrate}
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": bitrate,
+            }
         ],
         "embedmetadata": False,
         "embedthumbnail": False,
@@ -66,7 +79,9 @@ def download_video(task, quality):
 
 
 @app.get("/add")
-async def add_playlist(playlistURL: str, quality: str = "medium", background_tasks: BackgroundTasks = None):
+async def add_playlist(
+    playlistURL: str, quality: str = "low", background_tasks: BackgroundTasks = None
+):
     if not playlistURL:
         raise HTTPException(status_code=400, detail="playlistURL required")
 
@@ -87,6 +102,24 @@ async def add_playlist(playlistURL: str, quality: str = "medium", background_tas
 
 
 @app.get("/queue")
-async def list_queue():
+async def list_queue(state: str = None, skip: int = 0, limit: int = 50):
     with tasks_lock:
-        return {"tasks": download_tasks}
+        tasks = download_tasks
+        if state:
+            tasks = [t for t in download_tasks if t["state"] == state]
+        return {"tasks": tasks[skip : skip + limit]}
+
+
+@app.websocket("/ws/queue")
+async def websocket_queue(ws: WebSocket, refresh: float = 2):
+    # enforce minimum refresh interval
+    refresh = max(refresh, 0.25)
+    await ws.accept()
+    try:
+        while True:
+            with tasks_lock:
+                snapshot = download_tasks.copy()
+            await ws.send_json(snapshot)
+            await asyncio.sleep(refresh)
+    except Exception:
+        await ws.close()
