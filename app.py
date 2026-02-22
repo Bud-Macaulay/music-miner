@@ -8,8 +8,8 @@ import copy
 
 app = FastAPI()
 
-DOWNLOAD_DIR = Path("./downloads")
-ARCHIVE_FILE = Path("./download_archive.txt")
+DOWNLOAD_DIR = Path("/downloads")
+ARCHIVE_FILE = Path("/download_archive.txt")
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
