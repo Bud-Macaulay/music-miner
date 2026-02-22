@@ -1,9 +1,10 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, Query
+from fastapi.responses import RedirectResponse
 from yt_dlp import YoutubeDL
 from pathlib import Path
-from fastapi import WebSocket
 import threading
 import asyncio
+import copy
 
 app = FastAPI()
 
@@ -12,27 +13,36 @@ ARCHIVE_FILE = Path("./download_archive.txt")
 
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-lock = threading.Lock()
 tasks_lock = threading.Lock()
 
 # Each task is a dict: {"url": ..., "title": ..., "state": ...}
 download_tasks = []
 
 
-def extract_videos(playlist_url):
-    """
-    Returns a list of dicts for each video in the playlist.
-    """
-    ydl_opts = {"quiet": True, "extract_flat": True}
+def extract_playlist(url: str):
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "extract_flat": True,
+    }
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(playlist_url, download=False)
+        info = ydl.extract_info(url, download=False)
+
+        if "entries" not in info:
+            raise ValueError("Not a playlist")
+
         videos = []
-        for entry in info.get("entries", []):
-            if entry is None:
+        for entry in info["entries"]:
+            if not entry:
                 continue
+
+            video_url = entry.get("url")
+            if not video_url:
+                continue
+
             videos.append(
                 {
-                    "url": entry["url"],
+                    "url": video_url,
                     "title": entry.get("title", "Unknown"),
                     "state": "queued",
                 }
@@ -40,10 +50,25 @@ def extract_videos(playlist_url):
         return videos
 
 
+def extract_single_video(url: str):
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+    }
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+        return [
+            {
+                "url": info.get("webpage_url") or url,
+                "title": info.get("title", "Unknown"),
+                "state": "queued",
+            }
+        ]
+
+
 def download_video(task, quality):
-    """
-    Downloads a single video as MP3 and updates state.
-    """
     with tasks_lock:
         task["state"] = "downloading"
 
@@ -62,43 +87,58 @@ def download_video(task, quality):
                 "preferredquality": bitrate,
             }
         ],
-        "embedmetadata": False,
-        "embedthumbnail": False,
-        "writethumbnail": False,
     }
 
     try:
-        with lock:
-            with YoutubeDL(ydl_opts) as ydl:
-                ydl.download([task["url"]])
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([task["url"]])
+
         with tasks_lock:
             task["state"] = "finished"
+
     except Exception:
         with tasks_lock:
             task["state"] = "error"
 
 
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
+
+
 @app.get("/add")
-async def add_playlist(
-    playlistURL: str, quality: str = "low", background_tasks: BackgroundTasks = None
+async def add(
+    background_tasks: BackgroundTasks,
+    playlist: str | None = Query(None),
+    video: str | None = Query(None),
+    quality: str = "low",
 ):
-    if not playlistURL:
-        raise HTTPException(status_code=400, detail="playlistURL required")
+    if not playlist and not video:
+        raise HTTPException(400, "Provide either playlist or video parameter")
 
-    # Extract all videos first
     try:
-        videos = extract_videos(playlistURL)
+        if playlist:
+            videos = extract_playlist(playlist)
+        else:
+            videos = extract_single_video(video)
+
     except Exception:
-        raise HTTPException(status_code=400, detail="Failed to extract playlist info")
+        raise HTTPException(400, "Failed to extract media info")
 
+    # Prevent duplicates
     with tasks_lock:
-        download_tasks.extend(videos)
+        existing_urls = {t["url"] for t in download_tasks}
+        new_videos = [v for v in videos if v["url"] not in existing_urls]
+        download_tasks.extend(new_videos)
 
-    # Queue each video separately
-    for video in videos:
-        background_tasks.add_task(download_video, video, quality)
+    for task in new_videos:
+        background_tasks.add_task(download_video, task, quality)
 
-    return {"status": "queued", "videos": [v["title"] for v in videos]}
+    return {
+        "status": "queued",
+        "count": len(new_videos),
+        "titles": [v["title"] for v in new_videos],
+    }
 
 
 @app.get("/queue")
@@ -107,19 +147,27 @@ async def list_queue(state: str = None, skip: int = 0, limit: int = 50):
         tasks = download_tasks
         if state:
             tasks = [t for t in download_tasks if t["state"] == state]
+
         return {"tasks": tasks[skip : skip + limit]}
 
 
 @app.websocket("/ws/queue")
 async def websocket_queue(ws: WebSocket, refresh: float = 2):
-    # enforce minimum refresh interval
     refresh = max(refresh, 0.25)
     await ws.accept()
     try:
         while True:
             with tasks_lock:
-                snapshot = download_tasks.copy()
+                snapshot = copy.deepcopy(download_tasks)
             await ws.send_json(snapshot)
             await asyncio.sleep(refresh)
+
     except Exception:
         await ws.close()
+
+
+# for dev usage - uvicorn on port
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("app:app", host="0.0.0.0", port=8250, reload=True)
